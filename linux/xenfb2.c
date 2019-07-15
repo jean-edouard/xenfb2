@@ -20,7 +20,6 @@
 #include <linux/console.h>
 #include <linux/freezer.h>
 #include <xen/xenbus.h>
-#include <linux/kthread.h>
 #include <linux/fb.h>
 #include <xen/interface/io/protocols.h>
 #include <linux/version.h>
@@ -77,11 +76,6 @@ struct xenfb2_info
     int                         fb2m_npages;
     unsigned long               *fb2m;
 
-    unsigned long               *dirty_bitmap;
-    unsigned long               *shadow_bitmap;
-#define BITMAP_LEN(info) \
-    (((info)->fb_npages + BITS_PER_LONG - 1) / BITS_PER_LONG)
-
     struct list_head            mappings;
     struct mutex                mm_lock;
 
@@ -91,7 +85,6 @@ struct xenfb2_info
     unsigned long               cache_attr;
 #endif
     wait_queue_head_t           thread_wq;
-    struct task_struct          *kthread;
     unsigned long               thread_flags;
 
     wait_queue_head_t           checkvar_wait;
@@ -238,42 +231,10 @@ static int xenfb2_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
     if (pgnr >= info->fb_npages)
         return VM_FAULT_SIGBUS;
 
-    /*
-     * Contraption to change the cache policy from xenfb2.
-     * To have the vm_page_prot taken in account with _PAGE_CHG_MASK including (PCD | PWT),
-     * we cannot touch anything before and including fb_mmap() as pgprot_modify() will be called
-     * later in the path (mm/mmap.c) and mask _PAGE_CHG_MASK.
-     * Changing the policy in the vm_fault handler seems to be the best compromise for now.
-     */
-    if ((pgprot_val(vma->vm_page_prot) & _PAGE_CACHE_MASK) !=
-            cachemode2protval(info->cache_attr)) {
-        pgprot_val(vma->vm_page_prot) =
-            (pgprot_val(vma->vm_page_prot) & ~_PAGE_CACHE_MASK) |
-            cachemode2protval(info->cache_attr);
-    }
-
     page = info->fb_pages[pgnr];
     get_page(page);
 
     vmf->page = page;
-
-    /*
-     * Julian & Eric:
-     *
-     * Xorg may issue read accesses before actually writing on the
-     * framebuffer. Thus, subsequent write accesses on the same pages
-     * may not be trapped and reported properly in the dirty bitmap because
-     * the page is already mapped.
-     *
-     * We fix that by marking the page as dirty even for read accesses.
-     */
-#if 0
-    if (vmf->flags & FAULT_FLAG_WRITE) {
-        set_bit(pgnr % BITS_PER_LONG,
-                &info->shadow_bitmap[pgnr / BITS_PER_LONG]);
-    }
-#endif
-    set_bit(pgnr, &info->shadow_bitmap[0]);
 
     return 0;
 }
@@ -319,12 +280,8 @@ static int xenfb2_mmap(struct fb_info *fb_info, struct vm_area_struct *vma)
 #else
     vma->vm_flags |= (VM_DONTEXPAND | VM_RESERVED);
 #endif
-    vma->vm_private_data = map;
 
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(3,18,0))
-    vma->vm_page_prot = __pgprot((pgprot_val(vma->vm_page_prot) &
-                                  ~_PAGE_CACHE_MASK) | info->cache_attr);
-#endif
+    vma->vm_private_data = map;
 
     return 0;
 }
@@ -450,15 +407,10 @@ static void xenfb2_copyarea(struct fb_info *p, const struct fb_copyarea *area)
 static int xenfb2_release(struct fb_info *fb_info, int user)
 {
     struct xenfb2_info *info = fb_info->par;
-    unsigned int i;
 
-    if (info && info->fb) {
+    if (info && info->fb)
         memset(info->fb, 0, info->fb_size);
 
-        /* Update dirty bitmap */
-        for (i = 0; i < BITMAP_LEN(info); i++)
-            info->shadow_bitmap[i] = ~0;
-    }
     return 0;
 }
 
@@ -473,51 +425,6 @@ static struct fb_ops xenfb2_fb_ops = {
     .fb_set_par     = xenfb2_set_par,
     .fb_release     = xenfb2_release,
 };
-
-static int xenfb2_thread(void *data)
-{
-    struct xenfb2_info *info = (void *)data;
-    struct xenfb2_mapping *map;
-    unsigned long i;
-
-    wait_event_interruptible(info->thread_wq, kthread_should_stop() ||
-                             test_and_clear_bit(0, &info->thread_flags));
-    try_to_freeze();
-
-    while (!kthread_should_stop()) {
-        union xenfb2_out_event evt;
-
-        mutex_lock(&info->mm_lock);
-        list_for_each_entry(map, &info->mappings, link) {
-            struct vm_area_struct *vma = map->vma;
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0))
-            zap_page_range(vma, vma->vm_start, vma->vm_end - vma->vm_start);
-#else
-            zap_page_range(vma, vma->vm_start, vma->vm_end - vma->vm_start, NULL);
-#endif
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(3,18,0))
-            vma->vm_page_prot = __pgprot((pgprot_val(vma->vm_page_prot) &
-                                          ~_PAGE_CACHE_MASK) | info->cache_attr);
-#endif
-        }
-        mutex_unlock(&info->mm_lock);
-
-        /* Atomically copy shadow_bitmap to dirty bitmap and clear it */
-        for (i = 0; i < BITMAP_LEN(info); i++)
-            info->dirty_bitmap[i] = xchg(&info->shadow_bitmap[i], 0);
-
-        /* Send event */
-        evt.type = XENFB2_TYPE_DIRTY_READY;
-        xenfb2_send_event(info, (union xenfb2_out_event *)&evt);
-
-        wait_event_interruptible(info->thread_wq, kthread_should_stop() ||
-                                 test_and_clear_bit(0, &info->thread_flags));
-        try_to_freeze();
-    }
-
-    return 0;
-}
 
 static void xenfb2_update_dirty(struct xenfb2_info *info)
 {
@@ -736,7 +643,6 @@ xenfb2_probe(struct xenbus_device *dev,
     struct xenfb2_info *info;
     struct fb_info *fb_info;
     int ret = 0;
-    int i;
 
     info = kzalloc(sizeof (*info), GFP_KERNEL);
     if (!info) {
@@ -757,7 +663,6 @@ xenfb2_probe(struct xenbus_device *dev,
 
     info->thread_flags = 0;
     init_waitqueue_head(&info->thread_wq);
-    info->kthread = kthread_run(xenfb2_thread, info, "xenfb2 thread");
 
     xenfb2_backend_read_params(dev, info);
 
@@ -778,18 +683,6 @@ xenfb2_probe(struct xenbus_device *dev,
     info->fb2m = vmalloc(info->fb_npages * sizeof (unsigned long *));
     if (!info->fb2m)
         goto fail_nomem;
-
-    /* Shouldn't take more than 1 page */
-    info->dirty_bitmap = vmalloc(BITMAP_LEN(info) * sizeof (unsigned long));
-    if (!info->dirty_bitmap)
-        goto fail_nomem;
-    info->shadow_bitmap = kmalloc(BITMAP_LEN(info) * sizeof (unsigned long),
-                                  GFP_KERNEL);
-    if (!info->shadow_bitmap)
-        goto fail_nomem;
-
-    for (i = 0; i < BITMAP_LEN(info); i++)
-        info->shadow_bitmap[i] = ~0;
 
     info->shared_page = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
     if (!info->shared_page)
@@ -893,12 +786,6 @@ static int xenfb2_remove(struct xenbus_device *dev)
         kfree(info->fb_pages);
     if (info->fb)
         vfree(info->fb);
-    if (info->dirty_bitmap)
-        vfree(info->dirty_bitmap);
-    if (info->shadow_bitmap)
-        kfree(info->shadow_bitmap);
-    if (info->kthread)
-        kthread_stop(info->kthread);
 
     kfree(info);
 
@@ -950,8 +837,6 @@ static void xenfb2_init_shared_page(struct xenfb2_info *info,
          */
         spage->fb2m[i] = mfn;
     }
-
-    spage->dirty_bitmap_page = vmalloc_to_mfn((char *)info->dirty_bitmap);
 }
 
 static void xenfb2_backend_changed(struct xenbus_device *dev,
